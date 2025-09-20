@@ -78,20 +78,24 @@ The intent of the following listing is to demonstrate how a user could leverage
 the new interface to implement a client-side basic estimator.
 
 ```python
-from qiskit_ibm_runtime import QiskitRuntimeService, Session, NoiseLearner
-from qiskit.transpiler import PassManager
+from qiskit.transpiler import generate_preset_pass_manager
 from qiskit.transpiler.passes import NoiseLearningLayering
 from qiskit.circuit import QuantumCircuit, Parameter, QuantumRegister, ClassicalRegister
 
-# This proposal assumes the semantics implemented in samplomatic will become
-# part of qiskit semantics at some moment.
-from qiskit import samplex
-from qiskit.samplex.annotations import InjectNoise, Twirl
+# This proposal assumes the randomizaton semantics implemented in Samplomatic will become
+# part of Qiskit semantics.
+from qiskit.circuit.annotations import BasisTransform, InjectNoise, Twirl
 
-# The proposal is aligned with IBM current push in boosting quantum information
-# research through its offering and so, places the ExecutorProgram and the
-# Executor within a `quantum_info` module inside `qiskit_ibm_runtime` package.
-from qiskit_ibm_runtime.quantum_info import ExecutorProgram, Executor
+# IBM-proprietary Samplex becomes the vendor-agnostic RandomizationPlan.
+from qiskit.circuit.annotations.rand import RandomizationPlan
+
+from qiskit_ibm_runtime import QiskitRuntimeService, Session
+
+# Vendor-specific (such as IBM) classes derive from `Base` classes defined
+# in Qiskit. In particular, `QuantumProgram` and `NoiseLearningProgram` are both
+# `ExecutorProgram` instances.  
+from qiskit_ibm_runtime import Executor, QuantumProgram
+from qiskit_ibm_runtime import NoiseLearningProgram
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -108,39 +112,46 @@ with circuit.box([Twirl(), InjectNoise(ref="my_noise")]):
 with circuit.box([Twirl(), BasisTransform(ref="my_basis")]):
   circuit.measure_all()
 
+# Convert into ISA circuit.
+isa_pm = generate_preset_pass_manager(backend=backend, optimization_level=0)
+isa_circuit = isa_pm.run(circuit)
+
 # Extract layers of the circuit
-layers = find_unique_layers(circuit)
+circuit_layers = NoiseLearningProgram.find_unique_layers(isa_circuit)
 
 # Prepare circuit for executing
-template, samplex_ = samplex.build(circuit)
+template, plan = RandomizationPlan.build(isa_circuit)
 
 with Session(backend=backend) as session:
+  # Instantiate the programming model primitive
+  executor = Executor(backend)
+  
   # Learning noise
-  noise_learner = NoiseLearner(backend)
-  noise_learner_result = noise_learner.run(layers).result()
-  noise_map = noise_learner_result["noise_map"]
+  noise_learner = NoiseLearningProgram(circuit_layers)
+	job = executor.run(noise_learner)
+  result = job.result()
+  
+  # Extrac noise map
+  noise_map = { layer: model for zip(circuit_layers, result }
 
   # Preparing a quantum program for noise-aware sampling
-  program = ExecutorProgram(shots=1024)
+  program = QuantumProgram(shots=1024)
   program.define_symbol("my_noise", noise_map)
   program.define_symbol("my_basis", "XX")
-  program.append(template, samplex=samplex_)
-
-  # Execute (sample) the circuit
-  executor = Executor(backend)
+  program.append(template, randomization_plan=plan)
   job = executor.run(program)
 
 # And this section should estimate based on the results from sampling the
 # template and executing the samplex.
-results = job.results()
-signs = results["signs"]
-counts = results["meas"]
+result = job.result()
+signs = result["signs"]
+counts = result["meas"]
 expectation = mitigated_estimation(signs, counts)
 ```
 
-Both `ExecutorProgram` and `Executor` are implemented deriving from the base
-classes in Qiskit `BaseExecutorProgram` and `BaseExecutor`, with the following
-definitions:
+Both `QuantumProgram` and `NoiseLearningProgram` are implemented deriving
+from the base class in Qiskit `BaseExecutorProgram` and `Executor` is derived
+from `BaseExecutor`, with the following definitions:
 
 ```python
 # qiskit/primitives/containers/quantum_program.py
@@ -161,46 +172,74 @@ class BaseExecutor(ABC):
 
 ## Detailed Design
 
-### Executor program and program results
-The `Executor` primitive exposes a noise-aware compute model for running
-circuits enabling noise mitigation. The circuit represents, however, just a
-portion of the quantum computer operation. In the same way a classical computer
-does not run ALU operations only, the quantum computer needs additional
-instructions, and directives to deal with _aspects_ such as observable
-measurements, randomization, batching, or shot scheduling, to mention some. The
-`ExecutorProgram` interface captures all semantics needed to operate the quantum
-computer. 
+### Executor, ExecutorProgram, and ExecutorResult
+The `Executor` primitive introduces a general substrate for execution in
+Qiskit. A quantum circuit alone represents only part of the operation of a
+quantum computer. Just as a classical computer requires instructions beyond ALU
+operations, a quantum computer requires additional directives to govern
+*aspects* such as observable measurements, randomization, batching, or shot
+scheduling. The `ExecutorProgram` interface captures these semantics in a
+portable form.
 
-Once program execution is done, there is need for collecting not only computation
-results, but metadata about computation, including non-sensitive intermediate and
-final machine state. The `ExecutorResult` interface captures this data. 
+Execution produces not only raw measurement data but also metadata about the
+run, including reproducibility details and non-sensitive machine state. The
+`ExecutorResult` interface provides this data in a normalized detailed here:
 
-### Samplex annotations and the samplex data structure
-We discussed the need for instructions besides circuit operations. Samplex annotations
-are domain specific instructions and conform a domain specific language, or _DSL_, that
-augments circuit semantics to instruct the computer how to executor a randomization
-protocol for enabling error mitigation techniques. Given randomization semantics are
-tightly coupled to circuit operations, box annotations emerge as the natural
-implementation in Qiskit. 
+TBD: insert Python class definition.
 
-The samplex data structure encodes the steps for implementing randomization protocols
-in a directed acyclic graph, or _DAG_. The result of executing the randomization protocol
-on a circuit is the generation of potentially millions of circuit variations. Instead
-of requesting the client to generate these variations and transmit them through the wire,
-the `ExecutorProgram` package an optional samplex data structure to run it client-side,
-saving unnecesary bandwith, and potentially performing fast template circuit hydration
-withing the quantum computer runtime.
+Providers may include additional metadata (backend id, layout, noise
+diagnostics, etc.) but may redact or aggregate sensitive calibration data. Each
+provider is responsible for documenting what fields it returns.
+
+### Randomization annotations and plans
+In addition to circuit operations, users need a way to express semantics for
+error mitigation. **Annotations** (e.g., `Twirl`, `InjectNoise`) act as
+domain-specific instructions bound to circuit regions. These form a
+domain-specific language (DSL) that augments circuit semantics to express
+*intent*, such as running a randomization protocol.
+
+Annotations are compiled into a **Randomization Plan** (vendor-agnostic version
+of IBM Samplomatic's “samplex” data structure), a portable data structure describing
+how to generate circuit variations. The plan is constructed **after
+transpilation/layout**, ensuring that annotations refer to stable circuit regions. It
+is serializable and can be transmitted efficiently to the backend. Providers then
+expand the plan into potentially millions of concrete circuit variants server-side,
+reducing network load and preserving reproducibility.  
+
+The plan, together with user-defined symbols (e.g., noise maps, measurement
+bases), is packaged inside the `ExecutorProgram`. This allows fast template
+hydration within a provider’s runtime without requiring clients to generate or
+transmit large batches of circuits.
 
 ### Noise learning
-TBD
+Noise learning is a provider-specific capability where the system characterizes
+its own error profile. Learned artifacts such as a **noise map** can be returned
+in metadata or bound into an `ExecutorProgram` as symbols (e.g.,
+`program.define_symbol("my_noise", noise_map)`). This RFC does not standardize a
+specific noise-learning engine; it only ensures the `ExecutorProgram` can carry
+such symbols in a portable way.
+
+TBD: how an ExecutorProgram is serialized?
 
 ### System drift between learning and mitigation
-Explicit separation of noise learning and execution introduces the possibility for the
-system to drift in between the construction of the noise map and its application during
-mitigation. Drifting means the noise characterization may be outdated by the time the user
-wants to use it for error mitigation. To warrant error mitigation happens right after
-learning, the user can use runtime sessions to acquire exclusive access on the system, as
-shown in the example above.
+Separating noise learning from execution raises the risk of **system drift**:
+the characterization may become outdated between the time a noise map is built
+and when it is applied in mitigation. To reduce this risk, providers may offer
+*session-like constructs* that keep system state stable across a sequence of
+runs. In the IBM Runtime, for example, sessions can provide exclusive access so
+that noise learning and subsequent mitigation are performed back-to-back.  
+
+This RFC does not mandate sessions or exclusivity; these remain provider-owned
+features. The important point is that the `ExecutorProgram` substrate can
+represent both noise-learning and noise-mitigated execution, and users can
+combine them in a controlled workflow when supported.
+
+### Relation to existing primitives
+While this RFC does not replace existing primitives, it introduces a substrate
+that could host them. In particular, `Sampler` and `Estimator` can be
+re-implemented as thin profiles on top of the `Executor` abstraction. This would
+allow users to keep their familiar APIs while providers optimize around a single
+execution foundation. Such a reimplementation is left to future RFCs.
 
 ### Security and privacy considerations
 
