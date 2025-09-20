@@ -11,72 +11,69 @@
 | **Updated**       | 2025-08-30                                   |
 
 ## Summary
-In Qiskit, the quantum computer interface is built around primitives, which are
-the fundamental operations carried by a quantum computer on a quantum circuit.
-Currently, Qiskit offers two such primitives: the Sampler and the Estimator.
-The Estimator primitive computes expectation values from circuits and observables,
-while the Sampler samples the output register from quantum circuit execution. Qiskit
-IBM Runtime provides optimized implementations of the Qiskit primitives for IBM
-Quantum hardware. In particular, the Qiskit Runtime Estimator leverages advanced error
-mitigation techniques to enhance the quality of results from noisy quantum computers.
-On a noiseless quantum computer, this Estimator could instead be constructed atop the
-Sampler, simplifying its implementation. However, given current noise levels, robust
-error mitigation is essential, requiring executing thousands or even millions of circuit
-variations to implement certain mitigation protocols. 
+This RFC proposes the introduction of a new **Executor primitive** into Qiskit
+as a vendor-agnostic substrate for execution. The Executor provides
+infrastructure through three core components—**Executor**, **ExecutorProgram**,
+and **ExecutorResult**—which capture the relationship between an execution
+engine, its semantics, and its results.
 
-Advanced users might benefit from fine-grained control over the error mitigation strategy
-implementation, but transmitting how precisely to perform these circuit variations across
-cloud environments is inefficient. We found that this can be optimized using a "samplex",
-a data structure encoding all information about the randomization process and describing
-the way of producing these variations. The samplex enables efficient server-side generation
-of variations, with results transmitted back as samples accompanied by metadata, facilitating
-client-side implementation of error-mitigated estimations.
+The immediate motivation is to make **randomization semantics for error
+mitigation** first-class citizens in Qiskit. Today these workflows exist in an
+implicit and opaque form; this RFC proposes to standardize how users express
+their *intent* through annotations and portable representations. This enables
+fine-grained control, reproducibility, and composability of error-mitigation
+experiments while keeping provider implementations free to optimize expansion
+strategies.
+
+It is important to note that this RFC does **not** propose adopting a specific
+engine such as IBM’s Samplomatic into Qiskit. Instead, the scope is limited to
+defining the substrate (Executor) and the representation of user intent. Vendor
+implementations can build their own engines on top of these abstractions.
+Follow-up RFCs may introduce additional semantics or reference implementations
+(e.g. a noisy-statevector executor), but this proposal focuses on laying the
+foundation.
 
 ## Motivation
-The purpose of this development is addressing the growing demand within the
-quantum information science community for advanced error mitigation techniques.
-Users and researchers seek finer control over these techniques to improve the
-reliability of quantum computations, especially on noisy quantum hardware.
-Vendors like IBM have identified that users desire capabilities for precise
+The purpose of this proposal is to address the growing demand in the quantum
+information science community for advanced error-mitigation techniques. Users
+and researchers seek finer control over these methods to improve the reliability
+of computations on noisy quantum hardware, with interest in capabilities such as
 noise learning, twirling, and expectation value calculations.
 
-This proposal will enable Qiskit users to perform large-scale, backend-optimized
-error mitigation experiments without incurring the high network cost of
-transmitting thousands or millions of circuit variations. By shifting variation
-generation to the backend through a portable DSL, researchers can run advanced
-techniques more efficiently.
+Qiskit already supports large-scale mitigation experiments, but today the
+process is **implicit**—difficult to explain, compose, or control. By shifting
+circuit-variation generation to the backend through a portable representation,
+researchers can run these workflows more efficiently and without the high
+network cost of transmitting thousands of circuit variants. Making this process
+explicit also enables reproducibility through seeds and access to structured
+metadata for post-processing.
 
-Today, Qiskit users can already run large-scale error mitigation experiments,
-but the process is **implicit**—it is difficult to explain and difficult to
-compose, and users have no direct control over how circuit variations are
-generated or how mitigation is applied. This proposal introduces the **samplex**
-data structure, a portable object specifying explicitly encoding all information
-about the randomization process itself.
-
-With this, researchers can tailor error mitigation to their needs. The approach
-preserves backend optimizations while giving users fine-grained
-control, reproducibility through deterministic seeds, and access to structured
-metadata for postprocessing.
+To support this, we propose a new **Executor primitive**. The Executor provides
+a vendor-agnostic substrate for execution where semantics are captured in an
+**ExecutorProgram**. This allows providers to expose arbitrary programming
+models and gives Qiskit a single, extensible foundation for advanced semantics—
+with error mitigation as a leading use case, but equally applicable to future
+methods such as estimation, hybrid execution, noise learning protocols, or shot
+scheduling.
 
 ## User Benefit
 This proposal will primarily benefit researchers and practitioners working with
-noisy quantum hardware who require precise control over error mitigation
-strategies. By making the variation generation process explicit and
-user-definable, it empowers users to explore and tune novel error mitigation
-techniques.
+noisy quantum hardware who require precise control over advanced execution
+semantics. Error mitigation is a leading example: by making variation generation
+explicit and user-definable, users can explore and tune mitigation techniques
+more directly.
 
-Backend and platform developers will also benefit, as the **samplex** data structure
-creates a standard interface for describing randomization strategies that can be
-implemented consistently across vendors. This improves portability, reduces
-vendor lock-in, and enables backends to apply optimizations without sacrificing
-user intent.  
+Backend and platform developers will also benefit, as the proposed
+**representation** for variations and execution semantics provides a standard
+interface that can be implemented consistently across vendors. This improves
+portability, reduces vendor lock-in, and enables backends to apply optimizations
+without sacrificing user intent.
 
 Finally, the broader Qiskit community, including educators and tool developers,
-will gain a clearer and more composable model for error mitigation workflows,
-making it easier to experiment, reproduce results, and share techniques.
+will gain a clearer and more composable model for execution workflows, making it
+easier to experiment with new techniques, reproduce results, and share methods.
 
 ## Design Proposal
-
 The intent of the following listing is to demonstrate how a user could leverage
 the new interface to implement a client-side basic estimator.
 
@@ -91,7 +88,7 @@ from qiskit.circuit import QuantumCircuit, Parameter, QuantumRegister, Classical
 from qiskit import samplex
 from qiskit.samplex.annotations import InjectNoise, Twirl
 
-# The proposal is aligned with IBM current push in enabling quantum information
+# The proposal is aligned with IBM current push in boosting quantum information
 # research through its offering and so, places the ExecutorProgram and the
 # Executor within a `quantum_info` module inside `qiskit_ibm_runtime` package.
 from qiskit_ibm_runtime.quantum_info import ExecutorProgram, Executor
@@ -115,7 +112,7 @@ with circuit.box([Twirl(), BasisTransform(ref="my_basis")]):
 layers = find_unique_layers(circuit)
 
 # Prepare circuit for executing
-template, samplex_ = samplex.build()
+template, samplex_ = samplex.build(circuit)
 
 with Session(backend=backend) as session:
   # Learning noise
@@ -126,11 +123,8 @@ with Session(backend=backend) as session:
   # Preparing a quantum program for noise-aware sampling
   program = ExecutorProgram(shots=1024)
   program.define_symbol("my_noise", noise_map)
-  program.append(
-    template,
-    samplex=samplex_,
-    basis_transforms={"my_basis": "XX"},
-  )
+  program.define_symbol("my_basis", "XX")
+  program.append(template, samplex=samplex_)
 
   # Execute (sample) the circuit
   executor = Executor(backend)
@@ -145,7 +139,7 @@ expectation = mitigated_estimation(signs, counts)
 ```
 
 Both `ExecutorProgram` and `Executor` are implemented deriving from the base
-classes in Qiskit `ExecutorProgramBase` and `ExecutorBase`, with the following
+classes in Qiskit `BaseExecutorProgram` and `BaseExecutor`, with the following
 definitions:
 
 ```python
@@ -208,6 +202,28 @@ wants to use it for error mitigation. To warrant error mitigation happens right 
 learning, the user can use runtime sessions to acquire exclusive access on the system, as
 shown in the example above.
 
+### Security and privacy considerations
+
+The introduction of randomization semantics and metadata raises potential
+security and privacy issues:
+
+- **Noise maps and calibration data.** These may reveal proprietary details
+  about a provider’s hardware or calibration process. Providers may need to
+  redact, aggregate, or abstract sensitive information before returning it to
+  users.
+- **User-generated metadata.** Seeds, labels, and symbolic parameters may
+  contain experiment identifiers or other sensitive data. These must be stored
+  and transmitted securely, especially when persisted for reproducibility.
+- **Cross-provider reproducibility.** Metadata required for reproducibility
+  (e.g., seeds, plan identifiers) should be retained, but providers remain free
+  to limit or sanitize additional fields that could expose internal details.
+- **Documentation requirements.** Each provider should document what metadata is
+  returned, what may be redacted, and under what circumstances. This ensures
+  transparency for users while respecting provider confidentiality.
+
+These considerations do not affect the core `Executor` interfaces, but they are
+important for implementers to address in provider-specific documentation.
+
 ## Alternative Approaches
 An alternative to introducing the **samplex** DAG is to generate all circuit
 variations entirely on the client side and transmit them to the backend for
@@ -237,6 +253,16 @@ inspectability and debuggability would require local generation of the samplex
 DAG anyhow. More importantly, the compute model becomes simpler and honors its main
 responsibillity: execution.
 
+It is worth noting that earlier drafts of this RFC explored introducing the
+`Executor` as a sampler-like primitive that would directly capture additional
+semantics beyond the current `Sampler` and `Estimator`. While this approach
+could have delivered short-term functionality, we concluded that it risked
+creating yet another primitive with overlapping scope. Framing the design instead
+around the **`Executor`** as an abstract programming model is more future-proof
+and flexible: it allows different providers to expose their own semantics within a single
+substrate, and it mitigates fragmenting Qiskit’s compute interface with multiple
+too specialized primitives.
+
 ## Questions
 Open questions for discussion and an opening for feedback.
 
@@ -245,21 +271,26 @@ Open questions for discussion and an opening for feedback.
   locally based on a noisy `StateVector`?
 
 ## Future Extensions
+The introduction of the Executor is a first step toward evolving Qiskit's compute
+model with a single, general substrate for execution. This primitive can live
+side by side with existing primitives, offering an alternative path that
+gradually demonstrates its value without requiring immediate changes to the way
+Qiskit works. In this model, error mitigation, noise learning, and other forms
+of computation can be expressed directly on top of the Executor abstraction.
 
-The introduction of the Executor is just the first step inevolving Qiskit's
-compute model toward accepting a single, unified operation—this
-primitive—potentially deprecating the current definition of primitives altogether.
-In this model, noise learning, error mitigation, and any other computation could be
-implemented directly on top of the unified primitive abstraction.
+A natural follow-up will be to reimplement the existing `Sampler` and `Estimator`
+interfaces on top of `Executor`. Doing so would show how today’s most common
+workflows can be captured as lightweight profiles over the new substrate. This
+would give users a migration path with familiar APIs, while enabling providers
+to optimize around a single execution foundation.
 
-Future RFCs may explore implementing advanced workflows such as noise learning
-natively within this computation model, as well as replacing Qiskit’s existing
-compute interface with the unified approach. This shift would simplify the
+Beyond this, future RFCs may explore implementing more advanced workflows such
+as noise learning natively within the Executor model. This would simplify the
 execution pipeline, make workflows more composable, and provide a consistent
 foundation for new quantum algorithms and techniques.
 
-Additional future work could explore defining domain‑specific languages beyond
-**sampling** annotations, including DSLs dedicated to calculating expectation
-values or other specialized tasks. These DSLs could be layered on top of the
-unified primitive to further extend Qiskit’s flexibility and expressiveness while
-retaining backend portability.
+Additional extensions could include domain-specific representations beyond
+**randomization** annotations, such as those dedicated to calculating expectation
+values or shot scheduling. These could be layered on top of the Executor to
+further extend Qiskit’s flexibility and expressiveness while retaining backend
+portability.
