@@ -264,7 +264,7 @@ These considerations do not affect the core `Executor` interfaces, but they are
 important for implementers to address in provider-specific documentation.
 
 ## Alternative Approaches
-An alternative to introducing the **samplex** DAG is to generate all circuit
+An alternative to introducing the randomization plan DAG is to generate all circuit
 variations entirely on the client side and transmit them to the backend for
 execution. This approach offers maximum flexibility and complete control over
 how variations are produced, since the backend would simply execute the
@@ -280,16 +280,21 @@ execution time, and places substantial demands on both client and backend
 infrastructure. It also complicates reproducibility across vendors, since each
 vendor may handle large‑batch execution differently.
 
-By contrast, the **samplex** DAG allows users to describe their variation
+By contrast, the randomization plan allows users to describe their variation
 generation strategies in a portable, serialized form that can be transmitted
 efficiently. The backend can then expand these strategies into actual circuit
 variations locally, reducing network load while preserving user control over
 error mitigation techniques.
 
+Yet another alternative would have been sending a circuit template and a set
+of parameters on the wire for server parametrization although server expansion
+of the plan enables lazy generation of parameters where new parameters can be
+generated "on the fly" while other already-parametrized circuits are running. 
+
 An intermediate solution would have been to save the user from generating the
-samplex in the client, sending the annotated circuit only. However, local
-inspectability and debuggability would require local generation of the samplex
-DAG anyhow. More importantly, the compute model becomes simpler and honors its main
+plan in the client, sending the annotated circuit only. However, local
+inspectability and debuggability would require local generation of the reandomization
+plan anyhow. More importantly, the compute model becomes simpler and honors its main
 responsibillity: execution.
 
 It is worth noting that earlier drafts of this RFC explored introducing the
