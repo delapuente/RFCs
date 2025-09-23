@@ -131,8 +131,8 @@ with Session(backend=backend) as session:
 	job = executor.run(noise_learner)
   result = job.result()
   
-  # Extrac noise map
-  noise_map = { layer: model for zip(circuit_layers, result }
+  # Extract noise map
+  noise_map = { layer: model for zip(circuit_layers, result) }
 
   # Preparing a quantum program for noise-aware sampling
   program = QuantumProgram(shots=1024)
